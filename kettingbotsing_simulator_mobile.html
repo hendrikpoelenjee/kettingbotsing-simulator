@@ -1,0 +1,930 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>Kettingbotsing Simulator</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { background: #070c16; font-family: 'Courier New', monospace; overflow-x: hidden; }
+
+    /* ── Responsive grid overrides ── */
+    .rgrid { display: grid; gap: 12px; }
+    .rgrid-3 { grid-template-columns: repeat(3, 1fr); }
+    .rgrid-2 { grid-template-columns: repeat(2, 1fr); }
+    .rgrid-1 { grid-template-columns: 1fr; }
+
+    @media (max-width: 639px) {
+      .big-val { font-size: 15px !important; }
+      .header-title { font-size: 14px !important; }
+
+      .rgrid-3, .rgrid-2 { grid-template-columns: 1fr !important; }
+      .rgrid-2-keep { grid-template-columns: 1fr 1fr !important; }
+      /* Larger touch targets */
+      input[type=range] { height: 28px !important; }
+      button { min-height: 36px; }
+      /* Prevent font blow-up on iOS */
+      body { -webkit-text-size-adjust: 100%; }
+      /* Scrollable tabs */
+      .tab-bar { overflow-x: auto; -webkit-overflow-scrolling: touch; white-space: nowrap; }
+      .tab-bar::-webkit-scrollbar { display: none; }
+      /* Tighten padding on mobile */
+      .main-pad { padding: 12px 12px !important; }
+      .preset-bar { flex-wrap: nowrap !important; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+      .preset-bar::-webkit-scrollbar { display: none; }
+    }
+
+    /* Slider styling */
+    input[type=range] { -webkit-appearance: none; appearance: none; background: transparent; cursor: pointer; width: 100%; }
+    input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 0; height: 0; }
+    input[type=range]::-moz-range-thumb { width: 0; height: 0; border: none; }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: #0c1525; }
+    ::-webkit-scrollbar-thumb { background: #1a3050; border-radius: 2px; }
+
+    /* Tables scroll on mobile */
+    .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .table-wrap table { min-width: 480px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useMemo, useCallback, useEffect } = React;
+
+// ─── Colors ───────────────────────────────────────────────────────────────────
+const C = {
+  bg: "#070c16", panel: "#0c1525", card: "#101e30", border: "#1a3050",
+  A: "#e8c547", B: "#5b9bd5", Bc: "#e07b54",
+  text: "#d4dde8", muted: "#5a7090",
+  green: "#4ade80", yellow: "#facc15", orange: "#fb923c", red: "#f87171", purple: "#a78bfa",
+};
+
+// ─── Physics ──────────────────────────────────────────────────────────────────
+const toMs  = v => v / 3.6;
+const toKmh = v => v * 3.6;
+const fmt   = (n, d = 1) => Number(n).toFixed(d);
+const fmtEur = n => "€ " + Math.round(n).toLocaleString("nl-NL");
+
+function calcCollision(m1, v1_kmh, m2, v2_kmh, e, dt) {
+  const v1 = toMs(v1_kmh), v2 = toMs(v2_kmh);
+  const p1 = ((m1 - e * m2) * v1 + (1 + e) * m2 * v2) / (m1 + m2);
+  const p2 = ((m2 - e * m1) * v2 + (1 + e) * m1 * v1) / (m1 + m2);
+  const dv1 = Math.abs(v1 - p1), dv2 = Math.abs(v2 - p2);
+  const KE0 = 0.5 * m1 * v1 ** 2 + 0.5 * m2 * v2 ** 2;
+  const KE1 = 0.5 * m1 * p1 ** 2 + 0.5 * m2 * p2 ** 2;
+  return {
+    post1_kmh: toKmh(p1), post2_kmh: toKmh(p2),
+    dv1_kmh: toKmh(dv1), dv2_kmh: toKmh(dv2),
+    force_kN: (m1 * dv1 / dt) / 1000,
+    energy_kJ: (KE0 - KE1) / 1000,
+    impulse_kNs: (m1 * dv1) / 1000,
+  };
+}
+
+function calcScenario(p) {
+  // Collision 1: B hits A — both may be moving (A decelerating from noodstop)
+  const vA1 = p.vA_impact || 0;   // A's residual speed at impact moment
+  const vB1 = p.vB_impact || p.vB || 25; // B's speed at impact moment
+  const closingSpeed1 = Math.max(0, vB1 - vA1); // relative closing speed
+  const c1 = calcCollision(p.mB, vB1, p.mA, vA1, p.e, p.dt);
+  const vB2 = p.bStill ? 0 : Math.max(0, c1.post1_kmh);
+  const mTarget = p.coupled ? p.mA + p.mB : p.mB;
+  const c2 = calcCollision(p.mC, p.vC, mTarget, vB2, p.e, p.dt);
+  const sandwichForce_kN = p.coupled ? (p.mA * toMs(c2.dv2_kmh) / p.dt) / 1000 : 0;
+  const netCompression_kN = p.coupled ? c2.force_kN + sandwichForce_kN : c2.force_kN;
+  return { c1, c2, vB2, sandwichForce_kN, netCompression_kN, closingSpeed1, vA1, vB1 };
+}
+
+// ─── ETL logic ────────────────────────────────────────────────────────────────
+// Dutch insurer ETL threshold norms (repair cost as % of dagwaarde):
+const ETL_NORMS = [
+  { label: "Streng (50%)",        key: "strict",   ratio: 0.50, color: "#4ade80", desc: "Sommige verzekeraars / consumentenadvies" },
+  { label: "Gebruikelijk (67%)",  key: "common",   ratio: 0.667,color: "#facc15", desc: "Meest gehanteerde vuistregel NL (2/3)" },
+  { label: "Ruim (75%)",          key: "wide",     ratio: 0.75, color: "#fb923c", desc: "Gangbaar bij WA+Casco polissen" },
+  { label: "Volledig (100%)",     key: "full",     ratio: 1.00, color: "#f87171", desc: "Technisch max: reparatie > dagwaarde" },
+];
+
+function calcETL(tl) {
+  const { dagwaarde, restwaardeNa, repairFront, repairFrontC = 0, repairRear, merkantiel, etlRatioPct } = tl;
+  const liabilityB = repairFront;
+  const liabilityC = repairFrontC + repairRear + merkantiel;
+  const totalRepair = liabilityB + liabilityC;
+  const etlRatioThresh = etlRatioPct / 100;  // user-defined threshold (e.g. 0.67)
+
+  // Method A — ratio-based (insurer practice): repair > dagwaarde × threshold%
+  const ratioValue    = totalRepair / dagwaarde;         // actual repair/dagwaarde ratio
+  const isETL_ratio   = ratioValue >= etlRatioThresh;
+
+  // Method B — classic Dutch formula: repair > dagwaarde − restwaarde
+  const etlThreshold  = dagwaarde - restwaardeNa;
+  const classicRatio  = totalRepair / Math.max(1, etlThreshold);
+  const isETL_classic = classicRatio >= 1;
+
+  // Front only
+  const frontRatioVal   = repairFront / dagwaarde;
+  const frontETL_ratio  = frontRatioVal >= etlRatioThresh;
+  const frontETL_classic= repairFront >= etlThreshold;
+
+  // Rear (C's liability)
+  const rearContrib = repairRear + merkantiel;
+
+  // Expert claim: rear assessed against reduced dagwaarde post-front-damage
+  const dagwaardeNaVoor     = dagwaarde - repairFront;
+  const etlThreshNaVoor     = dagwaardeNaVoor - restwaardeNa;
+  const rearRatioNaVoor_cls = rearContrib / Math.max(1, etlThreshNaVoor);
+  const rearRatioNaVoor_rat = rearContrib / Math.max(1, dagwaardeNaVoor * etlRatioThresh - repairFront);
+  const expertClaimETL      = rearRatioNaVoor_cls >= 1;
+
+  // All-norms sweep
+  const normSweep = ETL_NORMS.map(n => ({
+    ...n,
+    threshold_eur: dagwaarde * n.ratio,
+    isETL: totalRepair >= dagwaarde * n.ratio,
+    frontETL: repairFront >= dagwaarde * n.ratio,
+    repairRatioPct: (totalRepair / dagwaarde) * 100,
+  }));
+
+  return {
+    totalRepair, liabilityB, liabilityC,
+    etlThreshold, classicRatio, isETL_classic,
+    ratioValue, isETL_ratio, etlRatioThresh,
+    repairFront, repairFrontC, repairRear, merkantiel, rearContrib,
+    frontRatioVal, frontETL_ratio, frontETL_classic,
+    dagwaardeNaVoor, etlThreshNaVoor, rearRatioNaVoor_cls, expertClaimETL,
+    normSweep,
+  };
+}
+
+function severity(kN) {
+  if (kN < 50)  return { label: "Licht",   color: C.green  };
+  if (kN < 120) return { label: "Matig",   color: C.yellow };
+  if (kN < 220) return { label: "Zwaar",   color: C.orange };
+  return               { label: "Ernstig", color: C.red    };
+}
+// ─── Responsive helpers ───────────────────────────────────────────────────────
+function useIsMobile() {
+  const [mobile, setMobile] = React.useState(window.innerWidth < 640);
+  React.useEffect(() => {
+    const handler = () => setMobile(window.innerWidth < 640);
+    window.addEventListener('resize', handler);
+    return () => window.removeEventListener('resize', handler);
+  }, []);
+  return mobile;
+}
+// Grid that stacks on mobile
+function RGrid({ cols = 3, gap = 12, mb = 0, children }) {
+  const mobile = useIsMobile();
+  return (
+    <div style={{
+      display: "grid",
+      gridTemplateColumns: mobile ? "1fr" : `repeat(${cols}, 1fr)`,
+      gap: mobile ? 10 : gap,
+      marginBottom: mb,
+    }}>{children}</div>
+  );
+}
+// Two-column grid that stacks on mobile
+function RGrid2({ gap = 14, mb = 14, children }) {
+  const mobile = useIsMobile();
+  return (
+    <div style={{
+      display: "grid",
+      gridTemplateColumns: mobile ? "1fr" : "1fr 1fr",
+      gap: mobile ? 10 : gap,
+      marginBottom: mb,
+    }}>{children}</div>
+  );
+}
+
+
+
+// ─── Defaults ─────────────────────────────────────────────────────────────────
+const DEFAULTS = {
+  mA: 1350, mB: 1835, mC: 2370,
+  vApproach: 15,   // common approach speed A+B before noodstop (km/h)
+  vA_impact: 2,    // speed of A at moment of B impact (residual after braking, km/h)
+  vB_impact: 12,   // speed of B at moment of impact (after braking attempt, km/h)
+  vC: 25,
+  e: 0.15, dt: 0.12, bStill: true, coupled: true
+};
+const ETL_DEFAULTS = {
+  dagwaarde: 28000,
+  restwaardeNa: 7500,
+  repairFront: 9500,      // front damage PRIMARY (B's liability)
+  repairFrontC: 3000,     // front damage PUSHTHROUGH/sandwich (C's liability)
+  repairRear: 4200,       // rear damage (C's liability)
+  merkantiel: 1800,       // merkantiele waardevermindering (C's liability)
+  etlRatioPct: 67,
+};
+
+const PRESETS = [
+  { label: "Jouw casus",  key: "actual",  params: { ...DEFAULTS, bStill: true,  coupled: true  } },
+  { label: "B rijdend",   key: "moving",  params: { ...DEFAULTS, bStill: false, coupled: false } },
+  { label: "Snelheid 50", key: "speed50", params: { ...DEFAULTS, vB: 50, vC: 50, bStill: true, coupled: true } },
+  { label: "Lichte X5",  key: "lightc",  params: { ...DEFAULTS, mC: 1900, bStill: true, coupled: true } },
+];
+
+// ─── UI Atoms ─────────────────────────────────────────────────────────────────
+function Slider({ label, param, value, min, max, step, unit, color, onChange, prefix = "" }) {
+  const pct = ((value - min) / (max - min)) * 100;
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
+        <span style={{ fontSize: 10, color: C.muted, letterSpacing: 1 }}>{label}</span>
+        <span style={{ fontSize: 12, fontWeight: 700, color: color || C.text }}>{prefix}{typeof value === "number" && value >= 1000 ? value.toLocaleString("nl-NL") : value}{unit}</span>
+      </div>
+      <div style={{ position: "relative", height: 4, background: C.border, borderRadius: 2 }}>
+        <div style={{ position: "absolute", left: 0, width: `${pct}%`, height: "100%", background: color || C.B, borderRadius: 2, transition: "width 0.1s" }} />
+        <input type="range" min={min} max={max} step={step} value={value}
+          onChange={e => onChange(param, Number(e.target.value))}
+          style={{ position: "absolute", top: -6, left: 0, width: "100%", height: 16, opacity: 0, cursor: "pointer" }} />
+        <div style={{ position: "absolute", left: `${pct}%`, top: "50%", transform: "translate(-50%,-50%)", width: 12, height: 12, borderRadius: "50%", background: color || C.B, border: `2px solid ${C.bg}`, pointerEvents: "none", transition: "left 0.1s" }} />
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between", marginTop: 3 }}>
+        <span style={{ fontSize: 9, color: C.muted }}>{prefix}{min}{unit}</span>
+        <span style={{ fontSize: 9, color: C.muted }}>{prefix}{max}{unit}</span>
+      </div>
+    </div>
+  );
+}
+
+function Toggle({ label, value, onChange, trueLabel = "Ja", falseLabel = "Nee", color }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+      <span style={{ fontSize: 10, color: C.muted, letterSpacing: 1 }}>{label}</span>
+      <div style={{ display: "flex", background: C.border, borderRadius: 4, overflow: "hidden" }}>
+        {[true, false].map(v => (
+          <button key={String(v)} onClick={() => onChange(v)}
+            style={{ padding: "4px 10px", fontSize: 10, border: "none", cursor: "pointer", fontFamily: "inherit", fontWeight: 700,
+              background: value === v ? (color || C.B) : "transparent",
+              color: value === v ? C.bg : C.muted, transition: "all 0.2s" }}>
+            {v ? trueLabel : falseLabel}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function BarGauge({ value, max, label, unit = "kN", refValue }) {
+  const pct = Math.min(100, (value / max) * 100);
+  const refPct = refValue != null ? Math.min(100, (refValue / max) * 100) : null;
+  const sev = severity(value);
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+        <span style={{ fontSize: 10, color: C.muted }}>{label}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {refValue != null && <span style={{ fontSize: 10, color: C.muted }}>ref: {fmt(refValue)}{unit}</span>}
+          <span style={{ fontSize: 13, fontWeight: 700, color: sev.color }}>{fmt(value)}{unit}</span>
+        </div>
+      </div>
+      <div style={{ position: "relative", height: 8, background: C.border, borderRadius: 4 }}>
+        <div style={{ width: `${pct}%`, height: "100%", background: sev.color, borderRadius: 4, transition: "width 0.3s" }} />
+        {refPct != null && <div style={{ position: "absolute", top: -2, left: `${refPct}%`, width: 2, height: 12, background: "#ffffff44", borderRadius: 1 }} />}
+      </div>
+      {refValue != null && Math.abs(value - refValue) > 0.05 && (
+        <div style={{ fontSize: 9, color: value > refValue ? C.orange : C.green, textAlign: "right", marginTop: 2 }}>
+          {value > refValue ? "▲" : "▼"} {fmt(Math.abs(value - refValue))}{unit} ({fmt(Math.abs((value - refValue) / Math.abs(refValue || 1)) * 100, 0)}%)
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ParamCard({ title, subtitle, color, icon, children }) {
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${color}33`, borderTop: `2px solid ${color}`, borderRadius: 6, padding: "14px 14px 10px" }}>
+      <div style={{ fontSize: 9, color, letterSpacing: 2, marginBottom: 2 }}>{icon} {title}</div>
+      <div style={{ fontSize: 11, color: C.muted, marginBottom: 12 }}>{subtitle}</div>
+      {children}
+    </div>
+  );
+}
+
+function SectionHeader({ label, sub, color }) {
+  return (
+    <div style={{ marginBottom: 10, paddingBottom: 6, borderBottom: `1px solid ${(color || C.border)}55` }}>
+      <span style={{ fontSize: 11, fontWeight: 700, color: color || C.text, letterSpacing: 1 }}>{label}</span>
+      {sub && <span style={{ fontSize: 10, color: C.muted, marginLeft: 10 }}>{sub}</span>}
+    </div>
+  );
+}
+
+function BigMetric({ label, value, unit, color, sub }) {
+  return (
+    <div style={{ background: C.card, border: `1px solid ${color}33`, borderTop: `2px solid ${color}`, borderRadius: 6, padding: "10px 12px" }}>
+      <div style={{ fontSize: 9, color: C.muted, marginBottom: 4, letterSpacing: 1 }}>{label}</div>
+      <div style={{ fontSize: 20, fontWeight: 700, color }}>{value}<span style={{ fontSize: 11, marginLeft: 3 }}>{unit}</span></div>
+      <div style={{ fontSize: 9, color: C.muted, marginTop: 2 }}>{sub}</div>
+    </div>
+  );
+}
+
+function InfoRow({ label, value, delta, unit = "" }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", padding: "3px 0", borderBottom: `1px solid ${C.border}33` }}>
+      <span style={{ fontSize: 10, color: C.muted }}>{label}</span>
+      <div>
+        <span style={{ fontSize: 10, color: C.text }}>{value}</span>
+        {delta !== undefined && Math.abs(delta) > 0.4 && (
+          <span style={{ fontSize: 9, color: delta > 0 ? C.orange : C.green, marginLeft: 6 }}>
+            {delta > 0 ? "▲" : "▼"}{Math.abs(delta)}{unit}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function LegalPoint({ n, title, children }) {
+  return (
+    <p style={{ margin: "0 0 10px", color: "#b0c4d8" }}>
+      <strong style={{ color: C.text }}>{n}. {title} · </strong>{children}
+    </p>
+  );
+}
+
+function SceneViz({ params }) {
+  return (
+    <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8, padding: "16px 12px 10px", marginBottom: 12 }}>
+      <div style={{ position: "relative", height: 64 }}>
+        <div style={{ position: "absolute", top: 44, left: 0, right: 0, height: 1, background: C.border }} />
+        <div style={{ position: "absolute", top: 54, left: 0, right: 0, borderTop: `1px dashed ${C.border}55` }} />
+        <div style={{ position: "absolute", top: 10, left: "36%", width: "14%", display: "flex", alignItems: "center" }}>
+          <div style={{ flex: 1, height: 1, background: C.B + "99" }} />
+          <span style={{ color: C.B + "99", fontSize: 12 }}>▶</span>
+          <span style={{ position: "absolute", top: -14, left: "20%", fontSize: 9, color: C.B + "aa", whiteSpace: "nowrap" }}>Impact 1</span>
+        </div>
+        <div style={{ position: "absolute", top: 10, left: "10%", width: "12%", display: "flex", alignItems: "center" }}>
+          <div style={{ flex: 1, height: 1, background: C.Bc + "99" }} />
+          <span style={{ color: C.Bc + "99", fontSize: 12 }}>▶</span>
+          <span style={{ position: "absolute", top: -14, left: "10%", fontSize: 9, color: C.Bc + "aa", whiteSpace: "nowrap" }}>Impact 2</span>
+        </div>
+        {[
+          { id: "A", x: 72, color: C.A,  v: params.vA_impact || 0 },
+          { id: "B", x: 50, color: C.B,  v: params.vB_impact || params.vB || 12 },
+          { id: "C", x: 22, color: C.Bc, v: params.vC },
+        ].map(car => (
+          <div key={car.id} style={{ position: "absolute", left: `${car.x}%`, top: 18, transform: "translateX(-50%)", textAlign: "center" }}>
+            <div style={{ width: 38, height: 20, background: car.color + "22", border: `1.5px solid ${car.color}`, borderRadius: 3, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: car.color }}>{car.id}</div>
+            <div style={{ fontSize: 8, color: C.muted, marginTop: 2 }}>{car.v} km/h</div>
+          </div>
+        ))}
+      </div>
+      <div style={{ fontSize: 9, color: C.muted, textAlign: "right" }}>→ rijrichting</div>
+    </div>
+  );
+}
+
+// ─── ETL Waterfall bar ────────────────────────────────────────────────────────
+function WaterfallBar({ dagwaarde, restwaardeNa, repairFront, repairFrontC = 0, repairRear, merkantiel, etlRatioPct }) {
+  const totalRepair = repairFront + repairRear + merkantiel;
+  const maxW = Math.max(dagwaarde, totalRepair) * 1.08;
+  const etlEur     = dagwaarde * (etlRatioPct / 100);
+  const classicEur = dagwaarde - restwaardeNa;
+
+  const bar = (val, color, label, striped = false) => {
+    const pct = Math.min(100, (val / maxW) * 100);
+    return (
+      <div style={{ marginBottom: 9 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+          <span style={{ fontSize: 10, color: C.muted }}>{label}</span>
+          <span style={{ fontSize: 11, fontWeight: 700, color }}>{fmtEur(val)}</span>
+        </div>
+        <div style={{ height: 14, background: C.border, borderRadius: 3, overflow: "hidden" }}>
+          <div style={{ width: `${pct}%`, height: "100%", borderRadius: 3, transition: "width 0.4s",
+            background: striped
+              ? `repeating-linear-gradient(45deg,${color}66,${color}66 4px,${color}22 4px,${color}22 8px)`
+              : color }} />
+        </div>
+      </div>
+    );
+  };
+
+  const marker = (val, color, label) => {
+    const pct = Math.min(98, (val / maxW) * 100);
+    return (
+      <div style={{ position: "relative", height: 22, marginBottom: 2 }}>
+        <div style={{ position: "absolute", left: `${pct}%`, top: 0, width: 2, height: 16, background: color + "bb" }} />
+        <div style={{ position: "absolute", left: `${pct}%`, top: 0, fontSize: 9, color, whiteSpace: "nowrap",
+          transform: pct > 55 ? "translateX(-105%)" : "translateX(4px)" }}>
+          {label} ({fmtEur(val)})
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div>
+      {bar(dagwaarde,           C.green,  "Dagwaarde (vóór schade)")}
+      {bar(restwaardeNa,        C.yellow, "Restwaarde / wrakwaarde (na schade)")}
+      <div style={{ borderTop: `1px dashed ${C.border}`, margin: "10px 0 8px" }} />
+      {bar(repairFront,   C.B,       "Reparatie voorzijde primair — aansprakelijk: B")}
+      {repairFrontC > 0 && bar(repairFrontC, "#38bdf8", "Reparatie voorzijde doordruk — aansprakelijk: C")}
+      {bar(repairRear,   C.Bc,      "Reparatie achterzijde — aansprakelijk: C")}
+      {bar(merkantiel,   C.purple,  "Merkantiele waardevermindering — aansprakelijk: C", true)}
+      {bar(totalRepair, totalRepair >= etlEur ? C.red : C.green, "Totale reparatiekosten")}
+      <div style={{ marginTop: 10 }}>
+        {marker(etlEur,     C.orange, `Norm-drempel (${etlRatioPct}% dagwaarde)`)}
+        {marker(classicEur, C.purple, "Klassieke drempel (dagwaarde − restwaarde)")}
+      </div>
+    </div>
+  );
+}
+
+// ─── ETL Verdict badge ────────────────────────────────────────────────────────
+function VerdictBadge({ isETL, ratioPct, label, sub }) {
+  const color = isETL ? C.red : C.green;
+  return (
+    <div style={{ background: color + "15", border: `1.5px solid ${color}55`, borderRadius: 8, padding: "10px 12px", textAlign: "center" }}>
+      <div style={{ fontSize: 16, marginBottom: 3 }}>{isETL ? "⚠" : "✓"}</div>
+      <div style={{ fontSize: 11, fontWeight: 700, color, letterSpacing: 1 }}>{isETL ? "ECON. TOTAL LOSS" : "REPARATIE ZINVOL"}</div>
+      <div style={{ fontSize: 18, fontWeight: 700, color, margin: "4px 0" }}>{fmt(ratioPct, 1)}%</div>
+      <div style={{ fontSize: 9, color: C.muted }}>van dagwaarde</div>
+      <div style={{ fontSize: 9, color: C.muted, marginTop: 4 }}>{label}</div>
+      {sub && <div style={{ fontSize: 9, color: color + "bb", marginTop: 2 }}>{sub}</div>}
+    </div>
+  );
+}
+
+// ─── Norm sweep table row ─────────────────────────────────────────────────────
+function NormRow({ norm, repairTotal, repairFront, dagwaarde, activeRatio }) {
+  const isActive  = Math.abs(norm.ratio - activeRatio) < 0.005;
+  const threshold = dagwaarde * norm.ratio;
+  const isETL     = repairTotal >= threshold;
+  const frontETL  = repairFront >= threshold;
+  const margin    = repairTotal - threshold;
+  return (
+    <tr style={{ background: isActive ? norm.color + "15" : "transparent" }}>
+      <td style={tdS(isActive ? norm.color : C.muted)}>
+        {isActive ? "▶ " : ""}{norm.label}
+      </td>
+      <td style={tdS(C.muted)}>{fmt(norm.ratio * 100, 0)}%</td>
+      <td style={tdS(C.text)}>{fmtEur(threshold)}</td>
+      <td style={tdS(isETL ? C.red : C.green)}>{isETL ? "⚠ ETL" : "✓ OK"}</td>
+      <td style={tdS(frontETL ? C.red : C.green)}>{frontETL ? "⚠ ETL" : "✓ OK"}</td>
+      <td style={tdS(margin > 0 ? C.red : C.green)}>{margin > 0 ? "+" : ""}{fmtEur(margin)}</td>
+      <td style={{ ...tdS(C.muted), fontSize: 9 }}>{norm.desc}</td>
+    </tr>
+  );
+}
+
+// ─── ETL Tab ─────────────────────────────────────────────────────────────────
+function ETLTab({ etl, setEtl }) {
+  const r = useMemo(() => calcETL(etl), [etl]);
+  const setE = (k, v) => setEtl(p => ({ ...p, [k]: v }));
+  const activeRatio = etl.etlRatioPct / 100;
+  const normButtons = [
+    { label: "50%", val: 50 }, { label: "67% (2/3)", val: 67 },
+    { label: "75%", val: 75 }, { label: "100%",      val: 100 },
+  ];
+
+  return (
+    <div>
+      {/* Row 1: value cards */}
+      <div className="rgrid rgrid-2" className="rgrid rgrid-2" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
+        <ParamCard title="VOERTUIG B — WAARDEBEPALING" subtitle="BMW 535i Touring" color={C.B} icon="💶">
+          <Slider label="DAGWAARDE (vóór alle schade)" param="dagwaarde" value={etl.dagwaarde}
+            min={2000} max={80000} step={500} unit="" prefix="€ " color={C.green} onChange={setE} />
+          <Slider label="RESTWAARDE / WRAKWAARDE (na alle schade)" param="restwaardeNa" value={etl.restwaardeNa}
+            min={500} max={30000} step={250} unit="" prefix="€ " color={C.yellow} onChange={setE} />
+          <div style={{ background: C.bg, borderRadius: 4, padding: "8px 10px", fontSize: 10 }}>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span style={{ color: C.muted }}>Klassieke drempel (dagwaarde − restwaarde)</span>
+              <span style={{ color: C.purple, fontWeight: 700 }}>{fmtEur(etl.dagwaarde - etl.restwaardeNa)}</span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", marginTop: 3 }}>
+              <span style={{ color: C.muted }}>Norm-drempel ({etl.etlRatioPct}% van dagwaarde)</span>
+              <span style={{ color: C.orange, fontWeight: 700 }}>{fmtEur(etl.dagwaarde * activeRatio)}</span>
+            </div>
+          </div>
+        </ParamCard>
+
+        <ParamCard title="ETL-DREMPEL · VERZEKERAARSNORM" subtitle="Percentage van de dagwaarde" color={C.orange} icon="⚖">
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: 9, color: C.muted, letterSpacing: 1, marginBottom: 6 }}>GANGBARE NORMEN</div>
+            <div style={{ display: "flex", gap: 6 }}>
+              {normButtons.map(b => (
+                <button key={b.val} onClick={() => setE("etlRatioPct", b.val)}
+                  style={{ flex: 1, padding: "6px 4px", fontSize: 10, fontFamily: "inherit", fontWeight: 700, cursor: "pointer", borderRadius: 4, border: "none",
+                    background: etl.etlRatioPct === b.val ? C.orange : C.border,
+                    color:      etl.etlRatioPct === b.val ? C.bg     : C.muted, transition: "all 0.2s" }}>
+                  {b.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <Slider label="ETL-DREMPEL (% van dagwaarde)" param="etlRatioPct" value={etl.etlRatioPct}
+            min={40} max={100} step={1} unit="%" color={C.orange} onChange={setE} />
+          <div style={{ fontSize: 10, color: C.muted, lineHeight: 1.7 }}>
+            <div><span style={{ color: C.green }}>50%</span> — consumentennorm / meest beschermend</div>
+            <div><span style={{ color: C.yellow }}>67%</span> — meest gangbaar NL (2/3 vuistregel)</div>
+            <div><span style={{ color: C.orange }}>75%</span> — ruimere polisinterpretatie</div>
+            <div><span style={{ color: C.red }}>100%</span> — technisch maximum</div>
+          </div>
+        </ParamCard>
+      </div>
+
+      {/* Row 2: repair cost sliders */}
+      <div style={{ marginBottom: 14 }}>
+        <ParamCard title="REPARATIEKOSTEN PER OORZAAK" subtitle="Gesplitst naar aansprakelijke partij" color={C.Bc} icon="🔧">
+          {/* Row A: primary splits */}
+          <div className="rgrid rgrid-2" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 24px", marginBottom: 4 }}>
+            <Slider label="VOORZIJDE PRIMAIR (aansprakelijk: B)" param="repairFront" value={etl.repairFront}
+              min={0} max={30000} step={100} unit="" prefix="€ " color={C.B} onChange={setE} />
+            <Slider label="VOORZIJDE DOORDRUK (aansprakelijk: C)" param="repairFrontC" value={etl.repairFrontC}
+              min={0} max={15000} step={100} unit="" prefix="€ " color="#38bdf8" onChange={setE} />
+          </div>
+          <div style={{ fontSize: 9, color: C.muted, marginBottom: 12, padding: "5px 8px", background: C.bg, borderRadius: 3 }}>
+            ⚑ Doordrukschade voorzijde veroorzaakt door X5 (C) via sandwicheffect — zelfstandige post ten laste van C (art. 6:98 BW)
+          </div>
+          <div className="rgrid rgrid-2" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 24px" }}>
+            <Slider label="ACHTERZIJDE (aansprakelijk: C)" param="repairRear" value={etl.repairRear}
+              min={0} max={20000} step={100} unit="" prefix="€ " color={C.Bc} onChange={setE} />
+            <Slider label="MERKANTIEL (aansprakelijk: C)" param="merkantiel" value={etl.merkantiel}
+              min={0} max={8000} step={100} unit="" prefix="€ " color={C.purple} onChange={setE} />
+          </div>
+
+          {/* Liability summary */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 10 }}>
+            <div style={{ background: C.B + "18", border: `1px solid ${C.B}33`, borderRadius: 4, padding: "8px 10px" }}>
+              <div style={{ fontSize: 9, color: C.B, letterSpacing: 1, marginBottom: 3 }}>AANSPRAKELIJKHEID B</div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: C.B }}>{fmtEur(etl.repairFront)}</div>
+              <div style={{ fontSize: 9, color: C.muted }}>Voorzijde primair</div>
+            </div>
+            <div style={{ background: C.Bc + "18", border: `1px solid ${C.Bc}33`, borderRadius: 4, padding: "8px 10px" }}>
+              <div style={{ fontSize: 9, color: C.Bc, letterSpacing: 1, marginBottom: 3 }}>AANSPRAKELIJKHEID C</div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: C.Bc }}>{fmtEur((etl.repairFrontC || 0) + etl.repairRear + etl.merkantiel)}</div>
+              <div style={{ fontSize: 9, color: C.muted }}>Doordruk voor + achter + merkantiel</div>
+            </div>
+          </div>
+
+          {/* Live readout strip */}
+          <div style={{ display: "flex", gap: 12, marginTop: 10, background: C.bg, borderRadius: 4, padding: "8px 10px" }}>
+            {[
+              ["Totaal herstel",    fmtEur(r.totalRepair),                               C.text],
+              ["% dagwaarde",       fmt(r.ratioValue * 100, 1) + "%",                    r.isETL_ratio ? C.red : C.green],
+              ["Norm-drempel",      fmtEur(etl.dagwaarde * activeRatio),                 C.orange],
+              ["Marge t.o.v. norm", fmtEur(r.totalRepair - etl.dagwaarde * activeRatio), r.isETL_ratio ? C.red : C.green],
+            ].map(([lbl, val, col], i) => (
+              <div key={i} style={{ flex: 1, textAlign: "center" }}>
+                <div style={{ fontSize: 9, color: C.muted, marginBottom: 2 }}>{lbl}</div>
+                <div style={{ fontSize: 12, fontWeight: 700, color: col }}>{val}</div>
+              </div>
+            ))}
+          </div>
+        </ParamCard>
+      </div>
+
+      {/* Waterfall */}
+      <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 6, padding: 16, marginBottom: 14 }}>
+        <SectionHeader label="WAARDEBEPALING · VISUEEL"
+          sub={`Norm-drempel (oranje): ${etl.etlRatioPct}% = ${fmtEur(etl.dagwaarde * activeRatio)}  ·  Klassieke drempel (paars): ${fmtEur(etl.dagwaarde - etl.restwaardeNa)}`}
+          color={C.A} />
+        <WaterfallBar dagwaarde={etl.dagwaarde} restwaardeNa={etl.restwaardeNa}
+          repairFront={etl.repairFront} repairFrontC={etl.repairFrontC || 0}
+          repairRear={etl.repairRear} merkantiel={etl.merkantiel} etlRatioPct={etl.etlRatioPct} />
+      </div>
+
+      {/* Norm sweep table */}
+      <div className="table-wrap" style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 6, overflowX: "auto", marginBottom: 14 }}>
+        <div style={{ padding: "10px 14px 8px", borderBottom: `1px solid ${C.border}` }}>
+          <span style={{ fontSize: 11, fontWeight: 700, color: C.A, letterSpacing: 1 }}>NORMENVERGELIJKING · ALLE GANGBARE DREMPELS</span>
+          <span style={{ fontSize: 10, color: C.muted, marginLeft: 10 }}>
+            Totaal herstel: {fmtEur(r.totalRepair)} · {fmt(r.ratioValue * 100, 1)}% van dagwaarde
+          </span>
+        </div>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+          <thead>
+            <tr style={{ background: C.card }}>
+              {["Norm", "%", "Drempel €", "Totaal ETL?", "Voor alleen ETL?", "Marge", "Toepassing"].map((h, i) => (
+                <th key={i} style={thS(C.muted)}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {ETL_NORMS.map(norm => (
+              <NormRow key={norm.key} norm={norm} repairTotal={r.totalRepair}
+                repairFront={etl.repairFront} dagwaarde={etl.dagwaarde} activeRatio={activeRatio} />
+            ))}
+            {!ETL_NORMS.some(n => Math.abs(n.ratio - activeRatio) < 0.005) && (
+              <NormRow norm={{ label: `Aangepast (${etl.etlRatioPct}%)`, key: "custom", ratio: activeRatio, color: C.B, desc: "Ingesteld via slider" }}
+                repairTotal={r.totalRepair} repairFront={etl.repairFront}
+                dagwaarde={etl.dagwaarde} activeRatio={activeRatio} />
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Three verdicts */}
+      <SectionHeader label="ETL-BEOORDELING · DRIE PERSPECTIEVEN" color={C.A} />
+      <div className="rgrid rgrid-3" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 14 }}>
+        <div>
+          <div style={{ fontSize: 10, color: C.muted, marginBottom: 6, letterSpacing: 1 }}>① TOTAALSCHADE (correct)</div>
+          <VerdictBadge isETL={r.isETL_ratio} ratioPct={r.ratioValue * 100}
+            label={`${fmtEur(r.totalRepair)} vs norm ${fmtEur(etl.dagwaarde * activeRatio)}`}
+            sub={`Norm: ${etl.etlRatioPct}% van dagwaarde`} />
+        </div>
+        <div>
+          <div style={{ fontSize: 10, color: C.muted, marginBottom: 6, letterSpacing: 1 }}>② ALLEEN VOORZIJDE (B)</div>
+          <VerdictBadge isETL={r.frontETL_ratio} ratioPct={r.frontRatioVal * 100}
+            label={`${fmtEur(etl.repairFront)} vs norm ${fmtEur(etl.dagwaarde * activeRatio)}`}
+            sub="Was voorzijde alleen al ETL?" />
+        </div>
+        <div>
+          <div style={{ fontSize: 10, color: C.orange, marginBottom: 6, letterSpacing: 1 }}>③ EXPERT-STELLING ⚠</div>
+          <VerdictBadge isETL={r.expertClaimETL} ratioPct={r.rearRatioNaVoor_cls * 100}
+            label={`Achter ${fmtEur(r.rearContrib)} vs verlaagde drempel ${fmtEur(Math.max(0, r.etlThreshNaVoor))}`}
+            sub="Klassieke methode na hyp. dagwaardedaling" />
+        </div>
+      </div>
+
+      {/* Rebuttal */}
+      <div style={{ background: "#e07b5411", border: `1px solid ${C.Bc}44`, borderLeft: `3px solid ${C.Bc}`, borderRadius: 6, padding: "14px 16px", fontSize: 11, lineHeight: 1.8 }}>
+        <div style={{ color: C.Bc, fontWeight: 700, marginBottom: 8, fontSize: 12 }}>⚖ WEERLEGGING EXPERT-STELLING · MET ACTUELE GETALLEN</div>
+        <p style={{ color: "#b0c4d8", margin: "0 0 8px" }}>
+          <strong style={{ color: C.text }}>Expert-claim:</strong> Na botsing 1 daalde de dagwaarde van B met {fmtEur(etl.repairFront)},
+          tot een hypothetische {fmtEur(r.dagwaardeNaVoor)}. De klassieke ETL-drempel daalt dan
+          naar {fmtEur(Math.max(0, r.etlThreshNaVoor))}, waardoor de achterschade {fmtEur(r.rearContrib)} als{" "}
+          <strong style={{ color: r.expertClaimETL ? C.red : C.green }}>
+            {r.expertClaimETL ? "ETL wordt bestempeld en beperkt vergoed" : "verhaalbaar wordt beschouwd"}
+          </strong>.
+        </p>
+        <p style={{ color: "#b0c4d8", margin: "0 0 8px" }}>
+          <strong style={{ color: C.text }}>Twee problemen:</strong> (1) Op het moment van botsing 2 was er
+          <em> geen formele taxatie, geen ETL-beslissing</em> — de hypothetische dagwaardedaling heeft geen juridische status (art. 6:97 BW).
+          (2) De {etl.etlRatioPct}%-norm wordt berekend over de <strong>dagwaarde vóór het incident</strong>, niet over een tussentijdse schatting.
+        </p>
+        <p style={{ color: "#b0c4d8", margin: 0 }}>
+          <strong style={{ color: C.text }}>Correct:</strong> Dagwaarde {fmtEur(etl.dagwaarde)} →
+          Norm-drempel ({etl.etlRatioPct}%): <strong style={{ color: C.orange }}>{fmtEur(etl.dagwaarde * activeRatio)}</strong> ·
+          Totaal herstel: <strong style={{ color: r.isETL_ratio ? C.red : C.green }}>{fmtEur(r.totalRepair)}</strong> →{" "}
+          <strong style={{ color: r.isETL_ratio ? C.red : C.green }}>{r.isETL_ratio ? "ETL" : "Reparatie zinvol"}</strong>.
+          Achterschade ({fmtEur(r.rearContrib)}) is zelfstandige post ten laste van C — ongeacht de volgorde van botsingen.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+const thS = c => ({ padding: "8px 12px", textAlign: "left", color: c, fontSize: 10, letterSpacing: 1, borderBottom: `1px solid ${C.border}`, fontWeight: 700 });
+const tdS = c => ({ padding: "6px 12px", color: c, borderBottom: `1px solid ${C.border}33`, fontSize: 11 });
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
+function App() {
+  const [params,    setParams]    = useState({ ...DEFAULTS });
+  const [refParams, setRefParams] = useState(null);
+  const [etl,       setEtl]       = useState({ ...ETL_DEFAULTS });
+  const [activeTab, setActiveTab] = useState("params");
+
+  const result    = useMemo(() => calcScenario(params), [params]);
+  const refResult = useMemo(() => refParams ? calcScenario(refParams) : null, [refParams]);
+
+  const setParam = useCallback((k, v) => setParams(p => ({ ...p, [k]: v })), []);
+  const loadPreset = preset => setParams({ ...preset.params });
+
+  const s1 = severity(result.c1.force_kN);
+  const s2 = severity(result.netCompression_kN);
+
+  const TABS = [
+    { key: "params",  label: "Parameters" },
+    { key: "results", label: "Resultaten" },
+    { key: "delta",   label: "Δ Vergelijking" },
+    { key: "etl",     label: "💶 Econ. Total Loss" },
+    { key: "legal",   label: "Juridisch" },
+  ];
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "'Courier New', monospace", fontSize: 12 }}>
+
+      {/* Header */}
+      <div style={{ background: "linear-gradient(135deg, #0c1525 0%, #162040 100%)", borderBottom: `1px solid ${C.border}`, padding: "14px 20px 10px" }}>
+        <div style={{ fontSize: 9, letterSpacing: 4, color: C.B, marginBottom: 3, textTransform: "uppercase" }}>Kinetische Dynamica Analyse · Interactieve Simulator</div>
+        <div style={{ fontSize: 17, fontWeight: 700, color: C.A, letterSpacing: 1 }}>KOP-STAART KETTINGBOTSING</div>
+        <div style={{ fontSize: 10, color: C.muted, marginTop: 2 }}>A: Renault Captur (trekhaak) · B: BMW 535i Touring · C: BMW X5 Hybrid</div>
+      </div>
+
+      {/* Preset bar */}
+      <div className="preset-bar" style={{ background: C.panel, borderBottom: `1px solid ${C.border}`, padding: "8px 12px", display: "flex", gap: 8, alignItems: "center" }}>
+        <span style={{ fontSize: 9, color: C.muted, letterSpacing: 2 }}>SCENARIO:</span>
+        {PRESETS.map(p => (
+          <button key={p.key} onClick={() => loadPreset(p)}
+            style={{ padding: "4px 10px", fontSize: 10, background: C.border, color: C.text, border: "none", borderRadius: 3, cursor: "pointer", fontFamily: "inherit", fontWeight: 600 }}>
+            {p.label}
+          </button>
+        ))}
+        <div style={{ flex: 1 }} />
+        {refResult
+          ? <button onClick={() => setRefParams(null)} style={{ padding: "4px 10px", fontSize: 10, background: "#f8717122", color: C.red, border: `1px solid ${C.red}44`, borderRadius: 3, cursor: "pointer", fontFamily: "inherit" }}>✕ Referentie wissen</button>
+          : <button onClick={() => setRefParams({ ...params })} style={{ padding: "4px 10px", fontSize: 10, background: "#5b9bd522", color: C.B, border: `1px solid ${C.B}44`, borderRadius: 3, cursor: "pointer", fontFamily: "inherit" }}>⊞ Stel als referentie</button>
+        }
+      </div>
+
+      {/* Tabs */}
+      <div className="tab-bar" style={{ background: C.panel, borderBottom: `1px solid ${C.border}`, display: "flex" }}>
+        {TABS.map(t => (
+          <button key={t.key} onClick={() => setActiveTab(t.key)}
+            style={{ padding: "10px 14px", fontSize: 10, letterSpacing: 1, border: "none", background: "transparent", cursor: "pointer", fontFamily: "inherit", fontWeight: 700,
+              color: activeTab === t.key ? C.A : C.muted,
+              borderBottom: `2px solid ${activeTab === t.key ? C.A : "transparent"}`,
+              transition: "all 0.2s" }}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="main-pad" style={{ padding: "16px 20px", maxWidth: 980, margin: "0 auto" }}>
+
+        {/* PARAMETERS */}
+        {activeTab === "params" && (
+          <div className="rgrid rgrid-3" style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 14 }}>
+            <ParamCard title="VOERTUIG A" subtitle="Renault Captur (trekhaak)" color={C.A} icon="🟡">
+              <Slider label="MASSA A" param="mA" value={params.mA} min={900} max={2000} step={25} unit=" kg" color={C.A} onChange={setParam} />
+              <Slider label="AANRIJSNELHEID A+B (voor noodstop)" param="vApproach" value={params.vApproach} min={5} max={50} step={1} unit=" km/h" color={C.A} onChange={setParam} />
+              <Slider label="RESTSNELHEID A op impactmoment" param="vA_impact" value={params.vA_impact} min={0} max={20} step={1} unit=" km/h" color={C.A} onChange={setParam} />
+              <div style={{ fontSize: 10, color: C.muted, padding: "6px 8px", background: C.bg, borderRadius: 3, marginTop: 2 }}>
+                Sluitingssnelheid B−A: <strong style={{ color: Math.max(0, params.vB_impact - params.vA_impact) < 5 ? C.green : C.orange }}>{Math.max(0, params.vB_impact - params.vA_impact).toFixed(1)} km/h</strong>
+              </div>
+              <div style={{ fontSize: 10, color: C.A + "99", marginTop: 6 }}>⚑ Trekhaak → puntbelasting ×3–5</div>
+            </ParamCard>
+            <ParamCard title="VOERTUIG B" subtitle="BMW 535i Touring" color={C.B} icon="🔵">
+              <Slider label="MASSA B" param="mB" value={params.mB} min={1200} max={2500} step={25} unit=" kg" color={C.B} onChange={setParam} />
+              <Slider label="SNELHEID B op impactmoment (na rempoging)" param="vB_impact" value={params.vB_impact} min={2} max={60} step={1} unit=" km/h" color={C.B} onChange={setParam} />
+              <Toggle label="B STILSTAAND BIJ BOTSING 2" value={params.bStill} onChange={v => setParam("bStill", v)} color={C.B} />
+              <Toggle label="B+A GEKOPPELD SYSTEEM" value={params.coupled} onChange={v => setParam("coupled", v)} color={C.B} />
+            </ParamCard>
+            <ParamCard title="VOERTUIG C" subtitle="BMW X5 Hybrid" color={C.Bc} icon="🟠">
+              <Slider label="MASSA C" param="mC" value={params.mC} min={1500} max={3500} step={25} unit=" kg" color={C.Bc} onChange={setParam} />
+              <Slider label="SNELHEID C (botsing 2)" param="vC" value={params.vC} min={5} max={120} step={1} unit=" km/h" color={C.Bc} onChange={setParam} />
+            </ParamCard>
+            <div style={{ gridColumn: "1 / -1" }}>
+              <ParamCard title="MODEL PARAMETERS" subtitle="Botsingsmodel" color={C.purple} icon="⚙">
+                <div className="rgrid rgrid-2" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 32px" }}>
+                  <Slider label="RESTITUTIECOËFFICIËNT (e)" param="e" value={params.e} min={0.0} max={0.5} step={0.01} unit="" color={C.purple} onChange={setParam} />
+                  <Slider label="CONTACTTIJD (Δt)" param="dt" value={params.dt} min={0.05} max={0.25} step={0.01} unit=" s" color={C.purple} onChange={setParam} />
+                </div>
+                <div style={{ fontSize: 10, color: C.muted }}>e = 0 (volledig plastisch) → e = 0,5 (semi-elastisch)</div>
+              </ParamCard>
+            </div>
+          </div>
+        )}
+
+        {/* RESULTS */}
+        {activeTab === "results" && (
+          <div>
+            <SceneViz params={params} />
+            <SectionHeader label="BOTSING 1"
+              sub={`B (${params.mB} kg · ${params.vB_impact} km/h) → A (${params.mA} kg · ${params.vA_impact} km/h) · sluitingssnelheid: ${result.closingSpeed1.toFixed(1)} km/h`}
+              color={C.B} />
+            <div className="rgrid rgrid-3" style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 10, marginBottom: 16 }}>
+              <BigMetric label="Impactkracht" value={fmt(result.c1.force_kN)} unit="kN" color={s1.color} sub={s1.label} />
+              <BigMetric label="Deformatie-energie" value={fmt(result.c1.energy_kJ)} unit="kJ" color={C.purple} sub="Geabsorbeerd" />
+              <BigMetric label="Impuls" value={fmt(result.c1.impulse_kNs, 2)} unit="kN·s" color={C.B} sub="Krachtstoot" />
+              <BigMetric label="ΔV voertuig B" value={fmt(result.c1.dv1_kmh)} unit="km/h" color={C.B} sub={`Post: ${fmt(Math.max(0, result.c1.post1_kmh))} km/h`} />
+              <BigMetric label="ΔV voertuig A" value={fmt(result.c1.dv2_kmh)} unit="km/h" color={C.A} sub={`Post: ${fmt(Math.max(0, result.c1.post2_kmh))} km/h`} />
+              <BigMetric label="KE voor botsing" value={fmt(0.5 * params.mB * toMs(params.vB) ** 2 / 1000)} unit="kJ" color={C.yellow} sub="Kinetische energie B" />
+            </div>
+            <SectionHeader label="BOTSING 2" sub={`C (${params.mC} kg · ${params.vC} km/h) → B${params.coupled ? "+A" : ""} · ${fmt(result.vB2)} km/h`} color={C.Bc} />
+            <div className="rgrid rgrid-3" style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 10, marginBottom: 10 }}>
+              <BigMetric label="Impactkracht C→B" value={fmt(result.c2.force_kN)} unit="kN" color={s2.color} sub={severity(result.c2.force_kN).label} />
+              <BigMetric label="Deformatie-energie" value={fmt(result.c2.energy_kJ)} unit="kJ" color={C.purple} sub="Geabsorbeerd" />
+              <BigMetric label="Impuls" value={fmt(result.c2.impulse_kNs, 2)} unit="kN·s" color={C.Bc} sub="Krachtstoot" />
+              <BigMetric label="ΔV voertuig C" value={fmt(result.c2.dv1_kmh)} unit="km/h" color={C.Bc} sub={`Post: ${fmt(Math.max(0, result.c2.post1_kmh))} km/h`} />
+              <BigMetric label={`ΔV voertuig B${params.coupled ? "+A" : ""}`} value={fmt(result.c2.dv2_kmh)} unit="km/h" color={C.B} sub={`Post: ${fmt(Math.max(0, result.c2.post2_kmh))} km/h`} />
+              <BigMetric label="KE voor botsing" value={fmt(0.5 * params.mC * toMs(params.vC) ** 2 / 1000)} unit="kJ" color={C.yellow} sub="Kinetische energie C" />
+            </div>
+            {params.coupled && (
+              <div style={{ background: "#e07b5411", border: `1px solid ${C.Bc}33`, borderRadius: 6, padding: "10px 14px", fontSize: 11, color: C.Bc }}>
+                <strong>⚠ SANDWICHEFFECT · </strong>
+                Reactiekracht A→B: <strong>{fmt(result.sandwichForce_kN)} kN</strong> ·
+                Netto compressie B: <strong style={{ color: C.red }}>{fmt(result.netCompression_kN)} kN</strong> ·
+                G-kracht B: <strong>{fmt((toMs(result.c2.dv2_kmh) / params.dt) / 9.81, 1)} g</strong>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* DELTA */}
+        {activeTab === "delta" && (
+          <div>
+            {!refResult ? (
+              <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 8, padding: 24, textAlign: "center", color: C.muted }}>
+                <div style={{ fontSize: 14, marginBottom: 8, color: C.text }}>Geen referentiescenario ingesteld</div>
+                <div style={{ fontSize: 11, marginBottom: 16 }}>Stel een scenario in als baseline, pas daarna sliders aan en vergelijk hier.</div>
+                <button onClick={() => setRefParams({ ...params })} style={{ padding: "8px 16px", background: C.B + "33", color: C.B, border: `1px solid ${C.B}55`, borderRadius: 4, cursor: "pointer", fontFamily: "inherit", fontSize: 11 }}>
+                  Huidige parameters als referentie
+                </button>
+              </div>
+            ) : (
+              <div>
+                <div className="rgrid rgrid-2" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 16 }}>
+                  <ParamCard title="REFERENTIE" subtitle="Vastgezette baseline" color={C.muted} icon="⊞">
+                    <InfoRow label="Massa A/B/C" value={`${refParams.mA} / ${refParams.mB} / ${refParams.mC} kg`} />
+                    <InfoRow label="Snelheid B / C" value={`${refParams.vB} / ${refParams.vC} km/h`} />
+                    <InfoRow label="B stilstaand" value={refParams.bStill ? "Ja" : "Nee"} />
+                    <InfoRow label="Gekoppeld" value={refParams.coupled ? "Ja" : "Nee"} />
+                    <InfoRow label="e / Δt" value={`${refParams.e} / ${refParams.dt}s`} />
+                  </ParamCard>
+                  <ParamCard title="HUIDIG" subtitle="Aangepaste parameters" color={C.A} icon="▶">
+                    <InfoRow label="Massa A/B/C" value={`${params.mA} / ${params.mB} / ${params.mC} kg`} delta={params.mC - refParams.mC} unit=" kg (C)" />
+                    <InfoRow label="Snelheid B / C" value={`${params.vB} / ${params.vC} km/h`} delta={params.vC - refParams.vC} unit=" km/h (C)" />
+                    <InfoRow label="B stilstaand" value={params.bStill ? "Ja" : "Nee"} />
+                    <InfoRow label="Gekoppeld" value={params.coupled ? "Ja" : "Nee"} />
+                    <InfoRow label="e / Δt" value={`${params.e} / ${params.dt}s`} />
+                  </ParamCard>
+                </div>
+                <SectionHeader label="DELTA · BOTSING 1 (B→A)" color={C.B} />
+                <div style={{ marginBottom: 16 }}>
+                  <BarGauge label="Impactkracht B→A" value={result.c1.force_kN} refValue={refResult.c1.force_kN} max={400} />
+                  <BarGauge label="Deformatie-energie" value={result.c1.energy_kJ} refValue={refResult.c1.energy_kJ} max={100} unit=" kJ" />
+                  <BarGauge label="ΔV voertuig B" value={result.c1.dv1_kmh} refValue={refResult.c1.dv1_kmh} max={60} unit=" km/h" />
+                </div>
+                <SectionHeader label="DELTA · BOTSING 2 (C→B)" color={C.Bc} />
+                <div style={{ marginBottom: 16 }}>
+                  <BarGauge label="Impactkracht C→B" value={result.c2.force_kN} refValue={refResult.c2.force_kN} max={400} />
+                  <BarGauge label="Netto compressie B" value={result.netCompression_kN} refValue={refResult.netCompression_kN} max={500} />
+                  <BarGauge label="Deformatie-energie" value={result.c2.energy_kJ} refValue={refResult.c2.energy_kJ} max={100} unit=" kJ" />
+                  <BarGauge label="ΔV voertuig C" value={result.c2.dv1_kmh} refValue={refResult.c2.dv1_kmh} max={60} unit=" km/h" />
+                </div>
+                <div className="table-wrap" style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 6, overflowX: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                    <thead><tr style={{ background: C.card }}>
+                      <th style={thS(C.muted)}>Metric</th><th style={thS(C.muted)}>Ref</th>
+                      <th style={thS(C.A)}>Huidig</th><th style={thS(C.muted)}>Delta</th><th style={thS(C.muted)}>%</th>
+                    </tr></thead>
+                    <tbody>
+                      {[["F B→A (kN)", refResult.c1.force_kN, result.c1.force_kN],
+                        ["F C→B (kN)", refResult.c2.force_kN, result.c2.force_kN],
+                        ["Compressie B (kN)", refResult.netCompression_kN, result.netCompression_kN],
+                        ["Energie B1 (kJ)", refResult.c1.energy_kJ, result.c1.energy_kJ],
+                        ["Energie B2 (kJ)", refResult.c2.energy_kJ, result.c2.energy_kJ],
+                      ].map(([lbl, ref, cur], i) => {
+                        const d = cur - ref, p = ref !== 0 ? (d / Math.abs(ref)) * 100 : 0;
+                        return (
+                          <tr key={i} style={{ background: i % 2 === 0 ? C.bg : C.panel }}>
+                            <td style={tdS(C.muted)}>{lbl}</td>
+                            <td style={tdS(C.text)}>{fmt(ref)}</td>
+                            <td style={tdS(severity(cur).color)}>{fmt(cur)}</td>
+                            <td style={tdS(d > 0.05 ? C.orange : d < -0.05 ? C.green : C.muted)}>{d > 0 ? "+" : ""}{fmt(d)}</td>
+                            <td style={tdS(d > 0.05 ? C.orange : d < -0.05 ? C.green : C.muted)}>{d > 0 ? "+" : ""}{fmt(p, 0)}%</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ETL */}
+        {activeTab === "etl" && <ETLTab etl={etl} setEtl={setEtl} />}
+
+        {/* LEGAL */}
+        {activeTab === "legal" && (
+          <div>
+            <div style={{ background: C.panel, border: `1px solid ${C.A}44`, borderLeft: `3px solid ${C.A}`, borderRadius: 6, padding: 16, marginBottom: 14, lineHeight: 1.8 }}>
+              <div style={{ color: C.A, fontWeight: 700, fontSize: 13, marginBottom: 10 }}>JURIDISCH-TECHNISCHE CONCLUSIE · ART. 6:98–6:99 BW</div>
+              <LegalPoint n="1" title="Krachtsverhouding">
+                Impactkracht botsing 1 (B→A): <strong style={{ color: C.B }}>{fmt(result.c1.force_kN)} kN</strong> ·
+                Botsing 2 (C→B): <strong style={{ color: C.Bc }}>{fmt(result.c2.force_kN)} kN</strong> ·
+                Verhouding: <strong style={{ color: C.A }}>{fmt((result.c2.force_kN / result.c1.force_kN) * 100, 0)}%</strong>. De stelling dat de achterschade "beperkt" was is kinetisch onjuist.
+              </LegalPoint>
+              <LegalPoint n="2" title="Sandwicheffect">
+                Netto compressielast op B: <strong style={{ color: C.red }}>{fmt(result.netCompression_kN)} kN</strong>. B werd van twee kanten samengeperst — structureel zwaarder dan een enkelvoudige impact.
+              </LegalPoint>
+              <LegalPoint n="3" title="Causaliteit (art. 6:99 BW)">
+                De achterschade heeft een zelfstandige oorzaak: aanrijding door C. Bewijslast dat deze schade reeds bestond rust op C's verzekeraar.
+              </LegalPoint>
+              <LegalPoint n="4" title="Dagwaardeargument">
+                Geabsorbeerde deformatieënergie door C: <strong style={{ color: C.A }}>{fmt(result.c2.energy_kJ)} kJ</strong>. Fysiek meetbaar en zelfstandig verhaalbaar. Een hypothetische dagwaardedaling op T=1s was niet vastgesteld en heeft geen juridische status (art. 6:97 BW).
+              </LegalPoint>
+              <LegalPoint n="5" title="Wrakwaardevermindering">
+                Zelfs bij ETL na botsing 1 verlaagt botsing 2 de wrakwaarde verder. Dit verschil is een zelfstandige schadepost ten laste van C (HR X/AMEV, 31 jan. 2003). Zie ETL-tab voor de berekening.
+              </LegalPoint>
+            </div>
+            <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 6, padding: "10px 14px", fontSize: 10, color: C.muted }}>
+              <span style={{ color: C.B }}>MODELGRENZEN · </span>
+              1D botsingsmodel · Δt en e zijn schattingen · Contra-expertise vereist voor rechtszaak · Resultaten zijn technische onderbouwing, geen juridisch bewijs.
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
